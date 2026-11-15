@@ -124,7 +124,12 @@ CLASSES: Sequence[type[CSBase]] = [
     sparse.csr_array,
     sparse.csc_array,
 ]
-TYPES: Sequence[type[CSType]] = [type(f"{cls.__name__}Type", (CSType,), {"cls": cls, "name": cls.__name__}) for cls in CLASSES]
+TYPES: Sequence[type[CSType]] = [
+    type(f"{cls.__name__}Type", (CSType,), {"cls": cls, "name": cls.__name__, "__module__": __name__}) for cls in CLASSES
+]
+# Bound under their own names in this module, so they pickle by reference:
+# numba’s disk cache keys on the pickled argument types, which otherwise differ every session.
+csr_matrixType, csc_matrixType, csr_arrayType, csc_arrayType = TYPES  # noqa: N816
 TYPEOF_FUNCS: Mapping[type[CSBase], Callable[[CSBase, _TypeofContext], CSType]] = {typ.cls: make_typeof_fn(typ) for typ in TYPES}
 MODELS: Mapping[type[CSType], type[CSModel]] = {typ: type(f"{typ.cls.__name__}Model", (CSModel,), {}) for typ in TYPES}
 

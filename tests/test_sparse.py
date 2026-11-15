@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
@@ -13,6 +14,7 @@ from testing.fast_array_utils import Flags
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from typing import Literal
 
     from pytest_codspeed import BenchmarkFixture
@@ -67,3 +69,33 @@ def test_to_dense_benchmark(
     mat = array_type.random((10_000, 10_000), dtype=dtype)
     to_dense(mat, order=order)  # warmup: numba compile
     benchmark(to_dense, mat, order=order)
+
+
+@pytest.mark.skipif(not find_spec("numba"), reason="numba not installed")
+def test_numba_types_cacheable(tmp_path: Path) -> None:
+    """Sparse numba types pickle by reference, so cached kernels taking them load in a new session."""
+    import pickle
+    import subprocess
+    import sys
+
+    import numba
+    import scipy.sparse as sp
+
+    from fast_array_utils._plugins.numba_sparse import TYPES
+
+    for cls in TYPES:  # each class is bound under its own name
+        assert pickle.loads(pickle.dumps(cls)) is cls
+    typ = numba.typeof(sp.random(3, 3, density=0.5, format="csr"))
+    assert pickle.loads(pickle.dumps(typ)) == typ
+
+    (tmp_path / "kernel_mod.py").write_text(
+        "import numba, numpy as np, scipy.sparse as sp, fast_array_utils\n"
+        "@numba.njit(cache=True)\n"
+        "def nnz(x):\n    return x.indptr[-1]\n"
+        "nnz(sp.random(5, 5, density=0.5, format='csr', dtype=np.float32))\n"
+    )
+    env = {**os.environ, "NUMBA_CACHE_DIR": str(tmp_path / "cache"), "NUMBA_DEBUG_CACHE": "1", "PYTHONPATH": str(tmp_path)}
+    runs = [subprocess.run([sys.executable, "-c", "import kernel_mod"], env=env, capture_output=True, text=True, check=True).stdout for _ in range(2)]
+    assert "data saved" in runs[0]
+    assert "data loaded" in runs[1]
+    assert "data saved" not in runs[1]
