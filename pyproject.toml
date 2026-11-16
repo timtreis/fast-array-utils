@@ -185,6 +185,7 @@ addopts = [
 ]
 doctest_subpackage_requires = [
   "src/fast_array_utils/conv/scipy/* = scipy",
+  "src/fast_array_utils/conv/scipy/_take_rows.py = numba",
   "src/fast_array_utils/conv/scipy/_to_dense.py = numba",
   "src/fast_array_utils/numba/* = numba",
   "src/fast_array_utils/stats/* = numba",
