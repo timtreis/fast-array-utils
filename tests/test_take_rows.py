@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from fast_array_utils.conv.scipy import take_rows
+from fast_array_utils.conv.scipy import compact_rows, take_rows
 from testing.fast_array_utils import SUPPORTED_TYPES
 
 
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from testing.fast_array_utils import ArrayType
 
 
-# take_rows takes SciPy CSR matrices and arrays only
+# both functions take SciPy CSR matrices and arrays only
 ATS_CSR = {at for at in SUPPORTED_TYPES if at.mod == "scipy.sparse" and at.name.startswith("csr_")}
 csr_types = pytest.mark.array_type(ATS_CSR)
 needs_numba = pytest.mark.skipif(not find_spec("numba"), reason="numba not installed")
@@ -174,6 +174,138 @@ def test_take_rows_rejects_csc() -> None:
         take_rows(sp.csc_matrix((3, 3)), np.array([0]))  # type: ignore[type-var]
 
 
+def _assert_compacted(x: sp.csr_matrix | sp.csr_array, expected: sp.csr_matrix | sp.csr_array, index_dtype: np.dtype[Any]) -> None:
+    """``x`` has ``expected``’s values and indices, and kept its own index dtype."""
+    assert x.shape == expected.shape
+    assert x.indptr.dtype == x.indices.dtype == index_dtype
+    np.testing.assert_array_equal(x.data, expected.data, strict=True)
+    np.testing.assert_array_equal(x.indices, expected.indices)
+    np.testing.assert_array_equal(x.indptr, expected.indptr)
+
+
+def _with_pruned_view_buffers(x: sp.csr_matrix | sp.csr_array) -> sp.csr_matrix | sp.csr_array:
+    """Make ``x``’s buffers views of larger arrays, as SciPy leaves them after pruning."""
+    for name in ("data", "indices"):
+        a = getattr(x, name)
+        buf = np.empty(a.size + 10, dtype=a.dtype)
+        buf[: a.size] = a
+        setattr(x, name, buf[: a.size])
+    return x
+
+
+_INCREASING_ROWS = [
+    pytest.param(_RNG.random(500) > 0.3, id="mask"),
+    pytest.param(np.arange(0, 500, 3), id="increasing"),
+    pytest.param(np.array([0, 7, -3, -1]), id="increasing-negative"),
+    pytest.param(slice(10, 400, 2), id="slice"),
+    pytest.param(np.ones(500, dtype=bool), id="all"),
+    pytest.param(np.zeros(500, dtype=bool), id="none"),
+    pytest.param(np.array([], dtype=np.int64), id="none-indices"),
+]
+
+
+@csr_types
+@pytest.mark.parametrize("buffers", ["own", "pruned-view"])
+@pytest.mark.parametrize("window", [7, 1 << 26], ids=["many-windows", "one-window"])
+@pytest.mark.parametrize("rows", _INCREASING_ROWS)
+def test_compact_rows(
+    x: sp.csr_matrix | sp.csr_array, rows: Any, window: int, buffers: str, use_numba: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fast_array_utils.conv import scipy as conv
+
+    if not use_numba and window != 1 << 26:
+        pytest.skip("windows only apply to the numba kernel")
+    monkeypatch.setattr(conv, "_WINDOW", window)
+    x = x.copy() if buffers == "own" else _with_pruned_view_buffers(x)
+    data = x.data
+    expected = x[rows]
+    assert compact_rows(x, rows) is None
+    _assert_compacted(x, expected, np.dtype(np.int32))
+    assert np.shares_memory(x.data, data) or x.nnz == 0  # moved within the old buffer
+
+
+@pytest.mark.usefixtures("use_numba")
+@csr_types
+@pytest.mark.parametrize("index_dtype", [np.int32, np.int64])
+def test_compact_rows_index_dtype(x: sp.csr_matrix | sp.csr_array, index_dtype: type[np.signedinteger[Any]]) -> None:
+    """``x`` keeps its index dtype, even where ``x[rows]`` would narrow it."""
+    x.indices, x.indptr = x.indices.astype(index_dtype), x.indptr.astype(index_dtype)
+    rows = np.arange(0, 500, 2)
+    expected = x[rows]
+    compact_rows(x, rows)
+    _assert_compacted(x, expected, np.dtype(index_dtype))
+
+
+@csr_types
+@pytest.mark.parametrize("rows", _INCREASING_ROWS)
+def test_compact_rows_unsupported_dtype(x: sp.csr_matrix | sp.csr_array, rows: Any) -> None:
+    """For dtypes numba can’t compile, SciPy’s result is copied back into ``x``."""
+    x = x.astype(np.longdouble)
+    expected = x[rows]
+    compact_rows(x, rows)
+    _assert_compacted(x, expected, np.dtype(np.int32))
+
+
+@needs_numba
+@csr_types
+@pytest.mark.parametrize("rows", _INCREASING_ROWS)
+def test_compact_rows_off_main_thread(x: sp.csr_matrix | sp.csr_array, rows: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off the main thread, the numba kernel moves the rows in place too, so the memory bound holds."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fast_array_utils.conv.scipy import _take_rows
+
+    calls: list[None] = []
+    kernel = _take_rows._compact_rows_csr_numba  # noqa: SLF001
+    monkeypatch.setattr(_take_rows, "_compact_rows_csr_numba", lambda *a: calls.append(None) or kernel(*a))
+    x = x.copy()
+    expected = x[rows]
+    with ThreadPoolExecutor(1) as pool:
+        # TODO(cluster): the first call off the main thread runs `njit`’s threading-layer probe (timeout 20 s)
+        pool.submit(compact_rows, x, rows).result(timeout=60)
+    _assert_compacted(x, expected, np.dtype(np.int32))
+    assert calls or expected.shape[0] == 500  # the kernel ran, unless all rows are kept
+
+
+@csr_types
+@pytest.mark.parametrize(
+    ("rows", "match"),
+    [
+        pytest.param(np.array([5, 2, 9]), "increasing", id="unsorted"),
+        pytest.param(np.array([2, 2, 9]), "increasing", id="repeats"),
+        pytest.param(np.array([-1, 0]), "increasing", id="negative-wraps"),
+        pytest.param(slice(None, None, -1), "increasing", id="slice-reversed"),
+        pytest.param(np.arange(3), "writeable", id="read-only"),
+    ],
+)
+def test_compact_rows_errors(x: sp.csr_matrix | sp.csr_array, rows: Any, match: str) -> None:
+    x = x.copy()
+    if match == "writeable":
+        x.data.flags.writeable = False
+    before = x.copy()
+    with pytest.raises(ValueError, match=match):
+        compact_rows(x, rows)
+    _assert_identical(x, before)  # raised before any data moved
+
+
+@pytest.mark.usefixtures("use_numba")
+@csr_types
+@pytest.mark.parametrize(
+    "rows", [np.array([500]), np.ones(499, dtype=bool), np.array([0.5]), *(pytest.param(p.values[0], id=p.id) for p in _NOT_1D)]
+)
+def test_compact_rows_index_errors(x: sp.csr_matrix | sp.csr_array, rows: Any) -> None:
+    x = x.copy()
+    before = x.copy()
+    with pytest.raises(IndexError):
+        compact_rows(x, rows)
+    _assert_identical(x, before)  # raised before any data moved
+
+
+def test_compact_rows_rejects_csc() -> None:
+    with pytest.raises(TypeError, match="CSR"):
+        compact_rows(sp.csc_matrix((3, 3)), np.array([0]))  # type: ignore[arg-type]
+
+
 @pytest.fixture(scope="module")
 def bench_x(array_type: ArrayType[sp.csr_matrix | sp.csr_array, None]) -> sp.csr_matrix | sp.csr_array:
     return array_type.random((100_000, 2_000), density=0.05, dtype=np.float32)
@@ -187,3 +319,12 @@ def test_take_rows_benchmark(benchmark: BenchmarkFixture, bench_x: sp.csr_matrix
     take_rows(bench_x, rows)  # warmup: numba compile
     benchmark(take_rows, bench_x, rows)
 
+
+@pytest.mark.benchmark
+@needs_numba
+@csr_types
+def test_compact_rows_benchmark(benchmark: BenchmarkFixture, bench_x: sp.csr_matrix | sp.csr_array) -> None:
+    rows = np.random.default_rng(1).random(bench_x.shape[0]) > 0.1
+    compact_rows(bench_x.copy(), rows)  # warmup: numba compile
+    # each round needs a fresh matrix, as compaction consumes it
+    benchmark.pedantic(compact_rows, setup=lambda: ((bench_x.copy(), rows), {}), rounds=5)
